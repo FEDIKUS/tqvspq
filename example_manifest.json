@@ -1,0 +1,10 @@
+{
+  "datasets": [
+    {
+      "name": "example_dataset",
+      "base": "relative/path/to/base.bin",
+      "query": "relative/path/to/query.bin",
+      "ground_truth": "relative/path/to/gt.bin"
+    }
+  ]
+}
