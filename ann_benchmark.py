@@ -217,7 +217,8 @@ def sample_training_vectors(
     seed: int,
 ) -> np.ndarray:
     min_required = 1 << bits
-    recommended = max(4096, 32 * min_required)
+    # FAISS warns below 39 training points per centroid for PQ k-means.
+    recommended = max(4096, 39 * min_required)
     size = min(base.shape[0], train_size or recommended)
     if size < min_required:
         raise ValueError(
@@ -296,22 +297,33 @@ def benchmark_reconstruction(
 
 
 def benchmark_topk_drift(
-    base: np.memmap,
     query: np.ndarray,
-    neighbor_ids: np.ndarray,
+    decoded_neighbors: np.ndarray,
     reference_distances: np.ndarray,
     batch_size: int,
-    reconstruct_fn,
 ) -> DriftStats:
     stats = DriftStats()
-    topk = neighbor_ids.shape[1]
     for slc in iter_slices(query.shape[0], batch_size):
         query_batch = query[slc]
-        neighbors = take_rows(base, neighbor_ids[slc]).reshape(query_batch.shape[0] * topk, base.shape[1])
-        decoded = reconstruct_fn(neighbors).reshape(query_batch.shape[0], topk, base.shape[1])
-        approx_distances = np.linalg.norm(query_batch[:, None, :] - decoded, axis=2)
+        approx_distances = np.linalg.norm(query_batch[:, None, :] - decoded_neighbors[slc], axis=2)
         stats.update(approx_distances - reference_distances[slc])
     return stats
+
+
+def predecode_neighbors(
+    base: np.memmap,
+    neighbor_ids: np.ndarray,
+    batch_size: int,
+    reconstruct_fn,
+) -> np.ndarray:
+    query_count, topk = neighbor_ids.shape
+    unique_ids, inverse = np.unique(neighbor_ids.reshape(-1), return_inverse=True)
+    decoded_unique = np.empty((unique_ids.shape[0], base.shape[1]), dtype=np.float32)
+    for slc in iter_slices(unique_ids.shape[0], batch_size):
+        batch_ids = unique_ids[slc]
+        batch = take_rows(base, batch_ids)
+        decoded_unique[slc] = reconstruct_fn(batch)
+    return decoded_unique[inverse].reshape(query_count, topk, base.shape[1])
 
 
 def benchmark_pq(
@@ -320,6 +332,7 @@ def benchmark_pq(
     neighbor_ids: np.ndarray,
     reference_distances: np.ndarray,
     config: BenchmarkConfig,
+    dataset_name: str,
 ) -> dict[str, Any]:
     dim = int(base.shape[1])
     pq = faiss.ProductQuantizer(dim, dim, config.pq_bits)
@@ -328,6 +341,7 @@ def benchmark_pq(
     train_start = time.perf_counter()
     pq.train(training_vectors)
     train_seconds = time.perf_counter() - train_start
+    log(f"{dataset_name}: PQ training finished in {train_seconds:.2f}s")
 
     def reconstruct(batch: np.ndarray) -> np.ndarray:
         return pq.decode(pq.compute_codes(batch))
@@ -335,17 +349,24 @@ def benchmark_pq(
     recon_start = time.perf_counter()
     recon_stats = benchmark_reconstruction(base, config.base_batch_size, reconstruct)
     recon_seconds = time.perf_counter() - recon_start
+    log(f"{dataset_name}: PQ reconstruction pass finished in {recon_seconds:.2f}s")
+
+    neighbor_decode_start = time.perf_counter()
+    decoded_neighbors = predecode_neighbors(base, neighbor_ids, config.base_batch_size, reconstruct)
+    neighbor_decode_seconds = time.perf_counter() - neighbor_decode_start
+    log(f"{dataset_name}: PQ neighbor predecode finished in {neighbor_decode_seconds:.2f}s")
 
     drift_start = time.perf_counter()
     drift_stats = benchmark_topk_drift(
-        base,
         query,
-        neighbor_ids,
+        decoded_neighbors,
         reference_distances,
         config.query_batch_size,
-        reconstruct,
     )
     drift_seconds = time.perf_counter() - drift_start
+    log(f"{dataset_name}: PQ top-k drift pass finished in {drift_seconds:.2f}s")
+
+    total_seconds = train_seconds + recon_seconds + neighbor_decode_seconds + drift_seconds
 
     return {
         "method": "pq",
@@ -354,7 +375,9 @@ def benchmark_pq(
         "bytes_per_vector": int(pq.code_size),
         "train_seconds": train_seconds,
         "reconstruction_seconds": recon_seconds,
+        "neighbor_predecode_seconds": neighbor_decode_seconds,
         "topk_distance_seconds": drift_seconds,
+        "total_seconds": total_seconds,
         "reconstruction_l2": recon_stats.to_dict(),
         "topk_distance_change_l2": drift_stats.to_dict(),
     }
@@ -366,6 +389,7 @@ def benchmark_turboquant_mse(
     neighbor_ids: np.ndarray,
     reference_distances: np.ndarray,
     config: BenchmarkConfig,
+    dataset_name: str,
 ) -> dict[str, Any]:
     import torch
     from turboquant import TurboQuantMSE
@@ -389,17 +413,24 @@ def benchmark_turboquant_mse(
     recon_start = time.perf_counter()
     recon_stats = benchmark_reconstruction(base, config.base_batch_size, reconstruct)
     recon_seconds = time.perf_counter() - recon_start
+    log(f"{dataset_name}: TurboQuant reconstruction pass finished in {recon_seconds:.2f}s")
+
+    neighbor_decode_start = time.perf_counter()
+    decoded_neighbors = predecode_neighbors(base, neighbor_ids, config.base_batch_size, reconstruct)
+    neighbor_decode_seconds = time.perf_counter() - neighbor_decode_start
+    log(f"{dataset_name}: TurboQuant neighbor predecode finished in {neighbor_decode_seconds:.2f}s")
 
     drift_start = time.perf_counter()
     drift_stats = benchmark_topk_drift(
-        base,
         query,
-        neighbor_ids,
+        decoded_neighbors,
         reference_distances,
         config.query_batch_size,
-        reconstruct,
     )
     drift_seconds = time.perf_counter() - drift_start
+    log(f"{dataset_name}: TurboQuant top-k drift pass finished in {drift_seconds:.2f}s")
+
+    total_seconds = recon_seconds + neighbor_decode_seconds + drift_seconds
 
     return {
         "method": "turboquant_mse",
@@ -410,7 +441,9 @@ def benchmark_turboquant_mse(
         "norm_bytes_per_vector": 4,
         "train_seconds": 0.0,
         "reconstruction_seconds": recon_seconds,
+        "neighbor_predecode_seconds": neighbor_decode_seconds,
         "topk_distance_seconds": drift_seconds,
+        "total_seconds": total_seconds,
         "reconstruction_l2": recon_stats.to_dict(),
         "topk_distance_change_l2": drift_stats.to_dict(),
     }
@@ -450,10 +483,17 @@ def benchmark_dataset(dataset: DatasetSpec, config: BenchmarkConfig) -> dict[str
     methods: dict[str, Any] = {}
     if "pq" in config.methods:
         log(f"{dataset.name}: running PQ ({config.pq_bits} bits/coord)")
-        methods["pq"] = benchmark_pq(base, query, neighbor_ids, reference_distances, config)
+        methods["pq"] = benchmark_pq(base, query, neighbor_ids, reference_distances, config, dataset.name)
     if "turboquant_mse" in config.methods:
         log(f"{dataset.name}: running TurboQuant MSE ({config.tq_bits} bits/coord)")
-        methods["turboquant_mse"] = benchmark_turboquant_mse(base, query, neighbor_ids, reference_distances, config)
+        methods["turboquant_mse"] = benchmark_turboquant_mse(
+            base,
+            query,
+            neighbor_ids,
+            reference_distances,
+            config,
+            dataset.name,
+        )
 
     return {
         "dataset": dataset.name,
@@ -497,6 +537,11 @@ def summarize(results: list[dict[str, Any]]) -> None:
             print(
                 "  "
                 f"{method_name}: bits={payload['bits_per_coordinate']} "
+                f"train_s={payload['train_seconds']:.2f} "
+                f"recon_s={payload['reconstruction_seconds']:.2f} "
+                f"neighbor_s={payload['neighbor_predecode_seconds']:.2f} "
+                f"drift_s={payload['topk_distance_seconds']:.2f} "
+                f"total_s={payload['total_seconds']:.2f} "
                 f"recon_mean={recon['mean']:.6f} "
                 f"topk_abs_mean={drift['mean_absolute_change']:.6f} "
                 f"topk_signed_mean={drift['mean_signed_change']:.6f}"
