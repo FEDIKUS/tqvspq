@@ -1,0 +1,10 @@
+{
+  "datasets": [
+    {
+      "name": "gist1M960",
+      "base": "gist1M960/base.bin",
+      "query": "gist1M960/query.bin",
+      "ground_truth": "gist1M960/gt.bin"
+    }
+  ]
+}
