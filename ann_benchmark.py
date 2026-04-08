@@ -399,6 +399,7 @@ def benchmark_turboquant_mse(
         bits=config.tq_bits,
         device=torch.device("cpu"),
         dtype=torch.float32,
+        seed=config.seed,
     ).eval()
 
     with torch.no_grad():
