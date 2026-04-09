@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 results.json
+local_deps/
+output*
+*.xlsx

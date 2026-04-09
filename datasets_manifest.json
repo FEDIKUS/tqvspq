@@ -4,67 +4,67 @@
       "name": "10M1024_ARM2_v2",
       "base": "10M1024_ARM2_v2/base_unique2.bin",
       "query": "10M1024_ARM2_v2/query2.bin",
-      "ground_truth": "10M1024_ARM2_v2/gt20_OUR2_unique_v3.bin"
+      "ground_truth": "10M1024_ARM2_v2/gt100.bin"
     },
     {
       "name": "1M1024_ARM2_v2",
       "base": "1M1024_ARM2_v2/base2_unique2.bin",
       "query": "1M1024_ARM2_v2/query3.bin",
-      "ground_truth": "1M1024_ARM2_v2/gt_OUR_D2_unique_v3.bin"
+      "ground_truth": "1M1024_ARM2_v2/gt100.bin"
     },
     {
       "name": "1M4096",
       "base": "1M4096/base.bin",
       "query": "1M4096/query.bin",
-      "ground_truth": "1M4096/gt.bin"
+      "ground_truth": "1M4096/gt100.bin"
     },
     {
       "name": "fashion60K784",
       "base": "fashion60K784/base.bin",
       "query": "fashion60K784/query.bin",
-      "ground_truth": "fashion60K784/gt.bin"
+      "ground_truth": "fashion60K784/gt100.bin"
     },
     {
       "name": "gist100K960",
       "base": "gist100K960/base.bin",
       "query": "gist100K960/query.bin",
-      "ground_truth": "gist100K960/gt.bin"
+      "ground_truth": "gist100K960/gt100.bin"
     },
     {
       "name": "gist1M960",
       "base": "gist1M960/base.bin",
       "query": "gist1M960/query.bin",
-      "ground_truth": "gist1M960/gt.bin"
+      "ground_truth": "gist1M960/gt100.bin"
     },
     {
       "name": "mobile_filter_1M256_no_filter1",
       "base": "mobile_filter_1M256_no_filter1/dataset_1m.bin",
       "query": "mobile_filter_1M256_no_filter1/query_1m.bin",
-      "ground_truth": "mobile_filter_1M256_no_filter1/gt100_1m.bin"
+      "ground_truth": "mobile_filter_1M256_no_filter1/gt100.bin"
     },
     {
       "name": "mobile_filter_1M256_no_filter2",
       "base": "mobile_filter_1M256_no_filter2/dataset_1m.bin",
       "query": "mobile_filter_1M256_no_filter2/query_custom.bin",
-      "ground_truth": "mobile_filter_1M256_no_filter2/gt_custom_100_1m.bin"
+      "ground_truth": "mobile_filter_1M256_no_filter2/gt100.bin"
     },
     {
       "name": "mobile_filter_25M256_no_filter1",
       "base": "mobile_filter_25M256_no_filter1/dataset_25m.bin",
       "query": "mobile_filter_25M256_no_filter1/query_25m.bin",
-      "ground_truth": "mobile_filter_25M256_no_filter1/gt100_25m.bin"
+      "ground_truth": "mobile_filter_25M256_no_filter1/gt100.bin"
     },
     {
       "name": "mobile_filter_25M256_no_filter2",
       "base": "mobile_filter_25M256_no_filter2/dataset_25m.bin",
       "query": "mobile_filter_25M256_no_filter2/query_custom.bin",
-      "ground_truth": "mobile_filter_25M256_no_filter2/gt_custom_100_25m.bin"
+      "ground_truth": "mobile_filter_25M256_no_filter2/gt100.bin"
     },
     {
       "name": "nytimes290K256",
       "base": "nytimes290K256/base.bin",
       "query": "nytimes290K256/query.bin",
-      "ground_truth": "nytimes290K256/gt.bin"
+      "ground_truth": "nytimes290K256/gt100.bin"
     }
   ]
 }

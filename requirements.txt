@@ -1,5 +1,6 @@
 faiss-cpu
 numpy
+openpyxl
 scipy
 torch
 # git+https://github.com/0xSero/turboquant.git@7ac9b8d165a3f7d5e6df33b0450bc1f88ec0d4d5

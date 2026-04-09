@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import datetime as dt
+import importlib.util
 import json
 import math
 import os
@@ -35,6 +36,7 @@ class DatasetSpec:
 class BenchmarkConfig:
     pq_bits: int
     tq_bits: int
+    tq_backend: str
     topk: int
     methods: tuple[str, ...]
     pq_train_size: int | None
@@ -199,15 +201,14 @@ def load_queries(path: str) -> np.ndarray:
     return np.array(open_vector_bin(path), dtype=np.float32, order="C", copy=True)
 
 
-def load_ground_truth_ids(path: str, query_count: int, topk: int) -> np.ndarray:
+def load_ground_truth_ids(path: str, query_count: int, requested_topk: int) -> tuple[np.ndarray, int]:
     gt_queries, gt_k = read_bin_header(path)
     if gt_queries < query_count:
         raise ValueError(f"{path} has only {gt_queries} queries, expected at least {query_count}")
-    if gt_k < topk:
-        raise ValueError(f"{path} has only top-{gt_k} neighbors, requested top-{topk}")
+    topk = min(requested_topk, gt_k)
 
     ids = np.memmap(path, dtype=np.uint32, mode="r", offset=8, shape=(gt_queries, gt_k))
-    return np.array(ids[:query_count, :topk], dtype=np.int64, order="C", copy=True)
+    return np.array(ids[:query_count, :topk], dtype=np.int64, order="C", copy=True), topk
 
 
 def sample_training_vectors(
@@ -236,9 +237,6 @@ def compute_exact_topk(
     base_batch_size: int,
     query_batch_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if base.shape[0] < topk:
-        raise ValueError(f"base_count={base.shape[0]} is smaller than requested topk={topk}")
-
     index = faiss.IndexFlatL2(base.shape[1])
     for slc in iter_slices(base.shape[0], base_batch_size):
         index.add(slice_rows(base, slc))
@@ -265,6 +263,31 @@ def compute_reference_distances(
         neighbors = take_rows(base, neighbor_ids[slc]).reshape(query_batch.shape[0], topk, base.shape[1])
         distances[slc] = np.linalg.norm(query_batch[:, None, :] - neighbors, axis=2)
     return distances
+
+
+def load_local_turboquant_mse_class():
+    repo_root = (pathlib.Path(__file__).resolve().parent / "../turboquant-pytorch").resolve()
+    module_path = repo_root / "turboquant.py"
+    if not module_path.is_file():
+        raise FileNotFoundError(f"Could not find local turboquant-pytorch module at {module_path}")
+
+    module_name = "_local_turboquant_pytorch"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load module spec for {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        sys.path.insert(0, str(repo_root))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            try:
+                sys.path.remove(str(repo_root))
+            except ValueError:
+                pass
+    return module.TurboQuantMSE
 
 
 def configure_threads(config: BenchmarkConfig) -> None:
@@ -392,24 +415,45 @@ def benchmark_turboquant_mse(
     dataset_name: str,
 ) -> dict[str, Any]:
     import torch
-    from turboquant import TurboQuantMSE
+    if config.tq_backend == "package":
+        from turboquant import TurboQuantMSE
 
-    quantizer = TurboQuantMSE(
-        dim=base.shape[1],
-        bits=config.tq_bits,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        seed=config.seed,
-    ).eval()
+        quantizer = TurboQuantMSE(
+            dim=base.shape[1],
+            bits=config.tq_bits,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            seed=config.seed,
+        ).eval()
 
-    with torch.no_grad():
-        packed_len = int(quantizer.quantize(torch.from_numpy(slice_rows(base, slice(0, 1)))).indices.shape[1])
-
-    def reconstruct(batch: np.ndarray) -> np.ndarray:
         with torch.no_grad():
-            tensor = torch.from_numpy(batch)
-            quantized = quantizer.quantize(tensor)
-            return quantizer.dequantize(quantized).cpu().numpy()
+            packed_len = int(quantizer.quantize(torch.from_numpy(slice_rows(base, slice(0, 1)))).indices.shape[1])
+
+        def reconstruct(batch: np.ndarray) -> np.ndarray:
+            with torch.no_grad():
+                tensor = torch.from_numpy(batch)
+                quantized = quantizer.quantize(tensor)
+                return quantizer.dequantize(quantized).cpu().numpy()
+
+        backend_name = "package"
+    elif config.tq_backend == "turboquant-pytorch":
+        TurboQuantMSE = load_local_turboquant_mse_class()
+        quantizer = TurboQuantMSE(base.shape[1], config.tq_bits, seed=config.seed, device="cpu").eval()
+        packed_len = (int(base.shape[1]) * int(config.tq_bits) + 7) // 8
+
+        def reconstruct(batch: np.ndarray) -> np.ndarray:
+            with torch.no_grad():
+                tensor = torch.from_numpy(batch)
+                norms = torch.linalg.vector_norm(tensor, dim=1, keepdim=True)
+                safe_norms = torch.clamp(norms, min=1e-8)
+                normalized = tensor / safe_norms
+                indices = quantizer.quantize(normalized)
+                reconstructed = quantizer.dequantize(indices)
+                return (reconstructed * norms).cpu().numpy()
+
+        backend_name = "turboquant-pytorch"
+    else:
+        raise ValueError(f"Unsupported TurboQuant backend: {config.tq_backend}")
 
     recon_start = time.perf_counter()
     recon_stats = benchmark_reconstruction(base, config.base_batch_size, reconstruct)
@@ -435,6 +479,7 @@ def benchmark_turboquant_mse(
 
     return {
         "method": "turboquant_mse",
+        "backend": backend_name,
         "bits_per_coordinate": config.tq_bits,
         "subspace_size": 1,
         "bytes_per_vector": int(packed_len + 4),
@@ -466,15 +511,26 @@ def benchmark_dataset(dataset: DatasetSpec, config: BenchmarkConfig) -> dict[str
     gt_start = time.perf_counter()
     if dataset.ground_truth:
         log(f"{dataset.name}: loading top-{config.topk} ground-truth neighbor ids")
-        neighbor_ids = load_ground_truth_ids(dataset.ground_truth, query.shape[0], config.topk)
+        neighbor_ids, effective_topk = load_ground_truth_ids(dataset.ground_truth, query.shape[0], config.topk)
+        if effective_topk < config.topk:
+            log(
+                f"{dataset.name}: ground truth provides only top-{effective_topk}; "
+                f"using that instead of requested top-{config.topk}"
+            )
         reference_distances = compute_reference_distances(base, query, neighbor_ids, config.query_batch_size)
         topk_source = "ground_truth"
     else:
-        log(f"{dataset.name}: computing exact top-{config.topk} neighbors with Faiss")
+        effective_topk = min(config.topk, int(base.shape[0]))
+        if effective_topk < config.topk:
+            log(
+                f"{dataset.name}: base has only {base.shape[0]} vectors; "
+                f"using top-{effective_topk} instead of requested top-{config.topk}"
+            )
+        log(f"{dataset.name}: computing exact top-{effective_topk} neighbors with Faiss")
         neighbor_ids, reference_distances = compute_exact_topk(
             base,
             query,
-            config.topk,
+            effective_topk,
             config.base_batch_size,
             config.query_batch_size,
         )
@@ -501,7 +557,8 @@ def benchmark_dataset(dataset: DatasetSpec, config: BenchmarkConfig) -> dict[str
         "base_count": int(base.shape[0]),
         "query_count": int(query.shape[0]),
         "dimension": int(base.shape[1]),
-        "topk": config.topk,
+        "requested_topk": config.topk,
+        "topk": effective_topk,
         "topk_source": topk_source,
         "topk_reference_seconds": gt_seconds,
         "methods": methods,
@@ -530,6 +587,7 @@ def summarize(results: list[dict[str, Any]]) -> None:
         print(
             f"{result['dataset']}  nbase={result['base_count']}  "
             f"nquery={result['query_count']}  dim={result['dimension']}  "
+            f"topk={result['topk']}/{result.get('requested_topk', result['topk'])}  "
             f"topk_source={result['topk_source']}"
         )
         for method_name, payload in result["methods"].items():
@@ -538,6 +596,7 @@ def summarize(results: list[dict[str, Any]]) -> None:
             print(
                 "  "
                 f"{method_name}: bits={payload['bits_per_coordinate']} "
+                f"backend={payload.get('backend', 'n/a')} "
                 f"train_s={payload['train_seconds']:.2f} "
                 f"recon_s={payload['reconstruction_seconds']:.2f} "
                 f"neighbor_s={payload['neighbor_predecode_seconds']:.2f} "
@@ -558,6 +617,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default=None, help="Optional prefix for relative paths in the manifest")
     parser.add_argument("--pq-bits", type=int, default=8, help="Bits per coordinate for FAISS PQ")
     parser.add_argument("--tq-bits", type=int, default=3, help="Bits per coordinate for TurboQuant MSE")
+    parser.add_argument(
+        "--tq-backend",
+        choices=("package", "turboquant-pytorch"),
+        default="package",
+        help="TurboQuant implementation: installed package or local ../turboquant-pytorch",
+    )
     parser.add_argument("--topk", type=int, default=20, help="Number of neighbors used for the distance-change metric")
     parser.add_argument(
         "--methods",
@@ -576,7 +641,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--faiss-threads", type=int, default=None, help="FAISS CPU threads per worker")
     parser.add_argument("--torch-threads", type=int, default=None, help="Torch CPU threads per worker")
     parser.add_argument("--torch-interop-threads", type=int, default=1, help="Torch inter-op threads per worker")
-    parser.add_argument("--seed", type=int, default=1234, help="Random seed for PQ training sampling")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="Random seed for PQ training sampling and TurboQuant initialization",
+    )
     parser.add_argument("--output", default=None, help="Optional JSON output path")
     return parser.parse_args()
 
@@ -606,6 +676,7 @@ def main() -> int:
     config = BenchmarkConfig(
         pq_bits=args.pq_bits,
         tq_bits=args.tq_bits,
+        tq_backend=args.tq_backend,
         topk=args.topk,
         methods=methods,
         pq_train_size=args.pq_train_size,
